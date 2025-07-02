@@ -8,8 +8,30 @@ import {
   onSnapshot,
   addDoc,
 } from "firebase/firestore";
-import VideoPlayer from "./VideoPlayer";
 import { useSearchParams } from "react-router-dom";
+
+// VideoPlayer Component
+const VideoPlayer = ({ stream, muted }: { stream: MediaStream; muted: boolean }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      console.log("Setting video stream for:", stream.id);
+      videoRef.current.srcObject = stream;
+      videoRef.current.play().catch((err) => console.error("Video play error:", err));
+    }
+  }, [stream]);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      muted={muted}
+      className="w-full h-64 bg-black rounded"
+    />
+  );
+};
 
 const VideoCall = () => {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -18,9 +40,17 @@ const VideoCall = () => {
   const [roomId, setRoomId] = useState<string>("");
   const peerConnections = useRef<Record<string, RTCPeerConnection>>({});
   const [searchParams, setSearchParams] = useSearchParams();
-  const clientId = Math.random().toString(36).substring(2); // Unique client ID
 
-  // Generate or use roomId from URL, prompt to create if not provided
+  // Generate a unique clientId using a more robust method
+  const clientId = useRef(
+    crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`
+  ).current;
+
+  useEffect(() => {
+    console.log("Initialized with clientId:", clientId);
+  }, [clientId]);
+
+  // Initialize room and media
   useEffect(() => {
     const initRoom = async () => {
       let id = searchParams.get("room");
@@ -34,6 +64,7 @@ const VideoCall = () => {
           video: true,
           audio: true,
         });
+        console.log("Local stream initialized:", stream.id, "Client ID:", clientId);
         setLocalStream(stream);
         await joinRoom(id);
       } catch (err) {
@@ -43,7 +74,9 @@ const VideoCall = () => {
     initRoom();
 
     return () => {
+      console.log("Cleaning up local stream");
       localStream?.getTracks().forEach((track) => track.stop());
+      Object.values(peerConnections.current).forEach((pc) => pc.close());
     };
   }, []);
 
@@ -52,6 +85,7 @@ const VideoCall = () => {
     const roomSnapshot = await getDoc(roomRef);
 
     if (!roomSnapshot.exists()) {
+      console.log("Creating new room:", id);
       await setDoc(roomRef, { participants: [] });
     }
 
@@ -60,17 +94,21 @@ const VideoCall = () => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === "added") {
           const data = change.doc.data();
+          console.log("Participant change detected:", data);
           if (data?.id !== clientId) {
+            console.log("Creating peer connection for:", data.id);
             await createPeerConnection(data?.id || "", roomRef);
           }
         }
       });
     });
 
+    console.log("Adding client to participants:", clientId);
     await setDoc(doc(participantsCollection, clientId), { id: clientId });
   };
 
   const createPeerConnection = async (peerId: string, roomRef: any) => {
+    console.log("Initializing peer connection for:", peerId);
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
@@ -78,45 +116,85 @@ const VideoCall = () => {
     peerConnections.current[peerId] = pc;
 
     if (localStream) {
-      localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+      localStream.getTracks().forEach((track) => {
+        console.log("Adding track to peer connection:", track.kind);
+        pc.addTrack(track, localStream);
+      });
     }
 
     pc.ontrack = (event) => {
       const stream = event.streams[0];
-      setRemoteStreams((prev) => [...prev.filter((s) => s.id !== stream.id), stream]);
+      console.log("Received remote stream:", stream.id);
+      setRemoteStreams((prev) => {
+        const exists = prev.some((s) => s.id === stream.id);
+        if (!exists) {
+          console.log("Adding new remote stream:", stream.id);
+          return [...prev, stream];
+        }
+        return prev;
+      });
     };
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        console.log("Sending ICE candidate to:", peerId);
         const candidatesCollection = collection(db, "rooms", roomId, "candidates");
         addDoc(candidatesCollection, {
           candidate: event.candidate,
           to: peerId,
           from: clientId,
-        });
+        }).catch((err) => console.error("Error sending ICE candidate:", err));
       }
     };
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+    // Listen for incoming offers
     const offersCollection = collection(db, "rooms", roomId, "offers");
-    await setDoc(doc(offersCollection, peerId), { offer, from: clientId });
+    onSnapshot(doc(offersCollection, clientId), async (docSnap) => {
+      const data = docSnap.data();
+      if (data?.offer && !pc.remoteDescription) {
+        console.log("Received offer from:", data.from);
+        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        const answersCollection = collection(db, "rooms", roomId, "answers");
+        await setDoc(doc(answersCollection, data.from), { answer, from: clientId });
+        console.log("Sent answer to:", data.from);
+      }
+    });
 
+    // Create and send offer
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      console.log("Created and sent offer for:", peerId);
+      await setDoc(doc(offersCollection, peerId), { offer, from: clientId });
+    } catch (err) {
+      console.error("Error creating/sending offer:", err);
+    }
+
+    // Listen for answers
     const answersCollection = collection(db, "rooms", roomId, "answers");
     onSnapshot(doc(answersCollection, clientId), (docSnap) => {
       const data = docSnap.data();
       if (data?.answer && !pc.remoteDescription) {
-        pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        console.log("Received answer from:", data.from);
+        pc.setRemoteDescription(new RTCSessionDescription(data.answer)).catch(
+          (err) => console.error("Error setting remote description:", err)
+        );
       }
     });
 
+    // Listen for ICE candidates
     const candidatesCollection = collection(db, "rooms", roomId, "candidates");
     onSnapshot(candidatesCollection, (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === "added") {
           const data = change.doc.data();
           if (data.to === clientId) {
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            console.log("Received ICE candidate from:", data.from);
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(
+              (err) => console.error("Error adding ICE candidate:", err)
+            );
           }
         }
       });
@@ -150,19 +228,23 @@ const VideoCall = () => {
     if (localStream) {
       localStream.getTracks().forEach((track) => track.stop());
     }
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true,
-    });
-    setLocalStream(stream);
-    Object.values(peerConnections.current).forEach((pc) => {
-      const sender = pc.getSenders().find(
-        (s) => s.track && s.track.kind === "video"
-      );
-      if (sender && stream.getVideoTracks()[0]) {
-        sender.replaceTrack(stream.getVideoTracks()[0]);
-      }
-    });
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      setLocalStream(stream);
+      Object.values(peerConnections.current).forEach((pc) => {
+        const sender = pc.getSenders().find(
+          (s) => s.track && s.track.kind === "video"
+        );
+        if (sender && stream.getVideoTracks()[0]) {
+          sender.replaceTrack(stream.getVideoTracks()[0]);
+        }
+      });
+    } catch (err) {
+      console.error("Error restoring camera stream:", err);
+    }
   };
 
   const startRecording = async () => {
@@ -184,7 +266,7 @@ const VideoCall = () => {
   };
 
   const copyInviteLink = () => {
-    const baseUrl = window.location.origin; // e.g., https://meet-clone-xyz.vercel.app
+    const baseUrl = window.location.origin;
     const inviteLink = `${baseUrl}?room=${roomId}`;
     navigator.clipboard.writeText(inviteLink).then(() => {
       alert("Invite link copied to clipboard!");
@@ -223,10 +305,22 @@ const VideoCall = () => {
           Record
         </button>
       </div>
-      <div className="grid grid-cols-2 gap-4">
-        {localStream && <VideoPlayer stream={localStream} muted={true} />}
+      <div className="grid grid-cols-2 gap-4 max-w-4xl">
+        {localStream && (
+          <div className="relative">
+            <VideoPlayer stream={localStream} muted={true} />
+            <p className="absolute bottom-2 left-2 text-white bg-black bg-opacity-50 px-2 py-1 rounded">
+              You
+            </p>
+          </div>
+        )}
         {remoteStreams.map((stream) => (
-          <VideoPlayer key={stream.id} stream={stream} muted={false} />
+          <div key={stream.id} className="relative">
+            <VideoPlayer stream={stream} muted={false} />
+            <p className="absolute bottom-2 left-2 text-white bg-black bg-opacity-50 px-2 py-1 rounded">
+              Participant
+            </p>
+          </div>
         ))}
       </div>
     </div>
