@@ -134,25 +134,38 @@ const VideoCall = () => {
         joinedAt: new Date().toISOString(),
       });
 
+      // Setup listeners first
+      await setupIncomingConnectionListener(roomId, stream);
+
+      // Then listen for participants
       const unsubscribeParticipants = onSnapshot(participantsCollection, (snapshot) => {
         const currentParticipants = new Set<string>();
+        const newParticipants: string[] = [];
 
         snapshot.docs.forEach((doc) => {
           const data = doc.data();
           if (data?.id && data.id !== clientId) {
             currentParticipants.add(data.id);
+            // Check if this is a new participant
+            if (!participants.has(data.id)) {
+              newParticipants.push(data.id);
+            }
           }
         });
 
         console.log("Current participants:", Array.from(currentParticipants));
+        console.log("New participants:", newParticipants);
 
-        currentParticipants.forEach(async (participantId) => {
-          if (!participants.has(participantId) && !peerConnections.current[participantId]) {
-            console.log("New participant detected:", participantId);
-            await createPeerConnection(participantId, roomId, stream, true);
+        // Handle new participants - only initiate if we have a lower ID (to avoid duplicate connections)
+        newParticipants.forEach(async (participantId) => {
+          if (!peerConnections.current[participantId]) {
+            const shouldInitiate = clientId < participantId; // Deterministic way to decide who initiates
+            console.log("New participant detected:", participantId, "shouldInitiate:", shouldInitiate);
+            await createPeerConnection(participantId, roomId, stream, shouldInitiate);
           }
         });
 
+        // Handle participants who left
         participants.forEach((participantId) => {
           if (!currentParticipants.has(participantId)) {
             console.log("Participant left:", participantId);
@@ -164,7 +177,6 @@ const VideoCall = () => {
       });
       unsubscribeFunctions.current.push(unsubscribeParticipants);
 
-      await setupIncomingConnectionListener(roomId, stream);
     } catch (err) {
       console.error("Error joining room:", err);
     }
@@ -179,9 +191,13 @@ const VideoCall = () => {
         if (change.type === "added") {
           const data = change.doc.data();
           const fromId = data.from;
-          if (fromId && fromId !== clientId && !peerConnections.current[fromId]) {
-            console.log("Received offer from:", fromId);
-            await createPeerConnection(fromId, roomId, stream, false);
+          console.log("Received offer from:", fromId);
+          
+          if (fromId && fromId !== clientId) {
+            // Create peer connection if it doesn't exist
+            if (!peerConnections.current[fromId]) {
+              await createPeerConnection(fromId, roomId, stream, false);
+            }
             await handleIncomingOffer(change.doc.id, data, fromId, roomId);
           }
         }
@@ -221,11 +237,16 @@ const VideoCall = () => {
       console.log("Received track from peer:", peerId, "kind:", event.track.kind);
       if (event.streams && event.streams[0]) {
         const remoteStream = event.streams[0];
-        console.log("Setting remote stream for peer:", peerId);
-        setRemoteStreams((prev) => new Map(prev).set(peerId, remoteStream));
+        console.log("Setting remote stream for peer:", peerId, "stream ID:", remoteStream.id);
+        setRemoteStreams((prev) => {
+          const newMap = new Map(prev);
+          newMap.set(peerId, remoteStream);
+          return newMap;
+        });
       }
     };
 
+    // Add local stream tracks
     if (stream) {
       stream.getTracks().forEach((track) => {
         console.log("Adding local track to peer connection:", track.kind, "for peer:", peerId);
@@ -260,15 +281,19 @@ const VideoCall = () => {
       }
     };
 
+    // Setup signaling listeners for this peer
     await setupSignalingListeners(pc, peerId, roomId);
 
+    // Create and send offer if we should initiate
     if (shouldInitiate) {
       try {
+        console.log("Creating offer for peer:", peerId);
         const offer = await pc.createOffer({
           offerToReceiveAudio: true,
           offerToReceiveVideo: true,
         });
         await pc.setLocalDescription(offer);
+        
         const offersCollection = collection(db, "rooms", roomId, "offers");
         await addDoc(offersCollection, {
           offer: offer,
@@ -285,12 +310,18 @@ const VideoCall = () => {
 
   const handleIncomingOffer = async (docId: string, data: any, fromId: string, roomId: string) => {
     const pc = peerConnections.current[fromId];
-    if (!pc) return;
+    if (!pc) {
+      console.error("No peer connection found for:", fromId);
+      return;
+    }
 
     try {
+      console.log("Handling offer from:", fromId);
       await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+      
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+      
       const answersCollection = collection(db, "rooms", roomId, "answers");
       await addDoc(answersCollection, {
         answer: answer,
@@ -298,7 +329,10 @@ const VideoCall = () => {
         to: fromId,
         timestamp: new Date().toISOString(),
       });
+      
       console.log("Sent answer to:", fromId);
+      
+      // Clean up the offer document
       await deleteDoc(doc(db, "rooms", roomId, "offers", docId));
     } catch (err) {
       console.error("Error handling incoming offer:", err);
@@ -308,6 +342,7 @@ const VideoCall = () => {
   const setupSignalingListeners = async (pc: RTCPeerConnection, peerId: string, roomId: string) => {
     const pendingCandidates: RTCIceCandidate[] = [];
 
+    // Listen for answers
     const answersCollection = collection(db, "rooms", roomId, "answers");
     const answerQuery = query(answersCollection, where("to", "==", clientId), where("from", "==", peerId));
 
@@ -316,17 +351,20 @@ const VideoCall = () => {
         if (change.type === "added") {
           const data = change.doc.data();
           try {
-            if (!pc.remoteDescription) {
-              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-              console.log("Set remote description from answer:", peerId);
-              while (pendingCandidates.length > 0) {
-                const candidate = pendingCandidates.shift();
-                if (candidate) {
-                  await pc.addIceCandidate(candidate);
-                  console.log("Added queued ICE candidate from:", peerId);
-                }
+            console.log("Received answer from:", peerId);
+            await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+            console.log("Set remote description from answer:", peerId);
+            
+            // Process any pending candidates
+            while (pendingCandidates.length > 0) {
+              const candidate = pendingCandidates.shift();
+              if (candidate) {
+                await pc.addIceCandidate(candidate);
+                console.log("Added queued ICE candidate from:", peerId);
               }
             }
+            
+            // Clean up the answer document
             await deleteDoc(change.doc.ref);
           } catch (err) {
             console.error("Error processing answer:", err);
@@ -336,6 +374,7 @@ const VideoCall = () => {
     });
     unsubscribeFunctions.current.push(unsubscribeAnswers);
 
+    // Listen for ICE candidates
     const candidatesCollection = collection(db, "rooms", roomId, "candidates");
     const candidateQuery = query(candidatesCollection, where("to", "==", clientId), where("from", "==", peerId));
 
@@ -350,6 +389,7 @@ const VideoCall = () => {
               sdpMid: data.candidate.sdpMid,
               usernameFragment: data.candidate.usernameFragment,
             });
+            
             if (pc.remoteDescription) {
               await pc.addIceCandidate(candidate);
               console.log("Added ICE candidate from:", peerId);
@@ -357,6 +397,8 @@ const VideoCall = () => {
               console.log("Queuing ICE candidate for:", peerId);
               pendingCandidates.push(candidate);
             }
+            
+            // Clean up the candidate document
             await deleteDoc(change.doc.ref);
           } catch (err) {
             console.error("Error adding ICE candidate:", err);
