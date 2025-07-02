@@ -7,6 +7,7 @@ import {
   setDoc,
   onSnapshot,
   addDoc,
+  deleteDoc,
 } from "firebase/firestore";
 import { useSearchParams } from "react-router-dom";
 
@@ -38,11 +39,12 @@ const VideoPlayer = ({ stream, muted }: { stream: MediaStream; muted: boolean })
 
 const VideoCall = () => {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [remoteStreams, setRemoteStreams] = useState<MediaStream[]>([]);
+  const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
   const [isSharingScreen, setIsSharingScreen] = useState(false);
   const [roomId, setRoomId] = useState<string>("");
   const peerConnections = useRef<Record<string, RTCPeerConnection>>({});
   const [searchParams, setSearchParams] = useSearchParams();
+  const unsubscribeFunctions = useRef<(() => void)[]>([]);
 
   // Generate a unique clientId
   const clientId = useRef(
@@ -90,6 +92,8 @@ const VideoCall = () => {
       }
       Object.values(peerConnections.current).forEach((pc) => pc.close());
       peerConnections.current = {};
+      unsubscribeFunctions.current.forEach((unsubscribe) => unsubscribe());
+      unsubscribeFunctions.current = [];
     };
   }, []);
 
@@ -107,7 +111,7 @@ const VideoCall = () => {
       }
 
       const participantsCollection = collection(db, "rooms", roomId, "participants");
-      onSnapshot(
+      const unsubscribeParticipants = onSnapshot(
         participantsCollection,
         (snapshot) => {
           snapshot.docChanges().forEach(async (change) => {
@@ -117,6 +121,18 @@ const VideoCall = () => {
                 console.log("Participant change detected:", data);
                 await createPeerConnection(data?.id || "", roomRef, roomId);
               }
+            } else if (change.type === "removed") {
+              const data = change.doc.data();
+              if (data?.id && peerConnections.current[data.id]) {
+                console.log("Participant left:", data.id);
+                peerConnections.current[data.id].close();
+                delete peerConnections.current[data.id];
+                setRemoteStreams(prev => {
+                  const newMap = new Map(prev);
+                  newMap.delete(data.id);
+                  return newMap;
+                });
+              }
             }
           });
         },
@@ -124,6 +140,7 @@ const VideoCall = () => {
           console.error("Snapshot error for participants:", error);
         }
       );
+      unsubscribeFunctions.current.push(unsubscribeParticipants);
 
       console.log("Adding client to participants:", clientId);
       await setDoc(doc(participantsCollection, clientId), { id: clientId });
@@ -142,6 +159,7 @@ const VideoCall = () => {
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
         {
           urls: "turn:openrelay.metered.ca:80",
           username: "openrelayproject",
@@ -157,48 +175,51 @@ const VideoCall = () => {
 
     peerConnections.current[peerId] = pc;
 
-    // Add local stream tracks
+    // IMPORTANT: Set up ontrack handler BEFORE adding local tracks
+    pc.ontrack = (event) => {
+      console.log("ontrack event received:", {
+        streamId: event.streams[0]?.id,
+        trackKind: event.track.kind,
+        trackEnabled: event.track.enabled,
+        trackReadyState: event.track.readyState,
+        streams: event.streams.length,
+      });
+
+      if (event.streams && event.streams[0]) {
+        const stream = event.streams[0];
+        console.log("Adding remote stream for peer:", peerId, "stream:", stream.id);
+        
+        setRemoteStreams(prev => {
+          const newMap = new Map(prev);
+          newMap.set(peerId, stream);
+          return newMap;
+        });
+
+        // Handle track ended
+        event.track.onended = () => {
+          console.log("Track ended for peer:", peerId, "track:", event.track.kind);
+          setRemoteStreams(prev => {
+            const newMap = new Map(prev);
+            const currentStream = newMap.get(peerId);
+            if (currentStream) {
+              const liveTracks = currentStream.getTracks().filter(t => t.readyState === "live");
+              if (liveTracks.length === 0) {
+                newMap.delete(peerId);
+              }
+            }
+            return newMap;
+          });
+        };
+      }
+    };
+
+    // Add local stream tracks AFTER setting up ontrack
     if (localStream) {
       localStream.getTracks().forEach((track) => {
         console.log("Adding track to peer connection:", track.kind, track.id, track.readyState);
         pc.addTrack(track, localStream);
       });
     }
-
-    // Handle incoming tracks
-    pc.ontrack = (event) => {
-      const stream = event.streams[0];
-      console.log("ontrack event:", {
-        streamId: stream.id,
-        trackKind: event.track.kind,
-        trackEnabled: event.track.enabled,
-        trackReadyState: event.track.readyState,
-        active: stream.active,
-        tracks: stream.getTracks().map((t) => ({
-          kind: t.kind,
-          enabled: t.enabled,
-          readyState: t.readyState,
-        })),
-      });
-      if (stream.active && stream.getVideoTracks().length > 0) {
-        setRemoteStreams((prev) => {
-          const exists = prev.some((s) => s.id === stream.id);
-          if (!exists) {
-            console.log("Adding new remote stream:", stream.id);
-            return [...prev, stream];
-          }
-          return prev;
-        });
-      } else {
-        console.warn("Received inactive or no video stream:", stream.id);
-      }
-      event.track.onended = () => {
-        console.log("Track ended:", event.track.kind, event.track.id);
-        setRemoteStreams((prev) =>
-          prev.filter((s) => s.getVideoTracks().some((t) => t.readyState === "live"))
-        );
-      };
-    };
 
     // Handle ICE candidates
     pc.onicecandidate = (event) => {
@@ -210,8 +231,6 @@ const VideoCall = () => {
           to: peerId,
           from: clientId,
         }).catch((err) => console.error("Error sending ICE candidate:", err));
-      } else {
-        console.log("All ICE candidates gathered for:", peerId);
       }
     };
 
@@ -222,126 +241,134 @@ const VideoCall = () => {
         console.error("Peer connection failed for", peerId);
         pc.close();
         delete peerConnections.current[peerId];
-        setRemoteStreams((prev) =>
-          prev.filter((s) => s.getVideoTracks().some((t) => t.readyState === "live"))
-        );
+        setRemoteStreams(prev => {
+          const newMap = new Map(prev);
+          newMap.delete(peerId);
+          return newMap;
+        });
       } else if (pc.connectionState === "connected") {
         console.log("Peer connection established with", peerId);
       }
     };
 
-    // Timeout for stalled connections
-    const timeout = setTimeout(() => {
-      if (pc.connectionState !== "connected") {
-        console.error("Peer connection timeout for", peerId);
-        pc.close();
-        delete peerConnections.current[peerId];
-        setRemoteStreams((prev) =>
-          prev.filter((s) => s.getVideoTracks().some((t) => t.readyState === "live"))
-        );
-      }
-    }, 30000);
+    // Set up signaling listeners
+    await setupSignalingListeners(pc, peerId, roomId);
 
-    pc.onconnectionstatechange = () => {
-      console.log("Peer connection state for", peerId, ":", pc.connectionState);
-      if (pc.connectionState === "connected") {
-        clearTimeout(timeout);
-      }
-    };
+    // Create and send offer
+    try {
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true,
+      });
+      await pc.setLocalDescription(offer);
+      console.log("Created and sent offer for:", peerId, "in room:", roomId);
+      const offersCollection = collection(db, "rooms", roomId, "offers");
+      await setDoc(doc(offersCollection, peerId), { 
+        offer: offer, 
+        from: clientId 
+      });
+    } catch (err) {
+      console.error("Error creating/sending offer:", err);
+    }
+  };
 
+  const setupSignalingListeners = async (pc: RTCPeerConnection, peerId: string, roomId: string) => {
     // Listen for incoming offers
     const offersCollection = collection(db, "rooms", roomId, "offers");
-    onSnapshot(
+    const unsubscribeOffers = onSnapshot(
       doc(offersCollection, clientId),
       async (docSnap) => {
         try {
           const data = docSnap.data();
-          if (data?.offer && !pc.remoteDescription) {
+          if (data?.offer && data.from === peerId && !pc.remoteDescription) {
             console.log("Received offer from:", data.from);
             await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             const answersCollection = collection(db, "rooms", roomId, "answers");
-            await setDoc(doc(answersCollection, data.from), { answer, from: clientId });
+            await setDoc(doc(answersCollection, data.from), { 
+              answer: answer, 
+              from: clientId 
+            });
             console.log("Sent answer to:", data.from);
+            // Clean up the offer
+            await deleteDoc(doc(offersCollection, clientId));
           }
         } catch (err) {
           console.error("Error processing offer:", err);
         }
-      },
-      (err) => console.error("Snapshot error for offers:", err)
+      }
     );
-
-    // Create and send offer
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      console.log("Created and sent offer for:", peerId, "in room:", roomId);
-      const offersCollection = collection(db, "rooms", roomId, "offers");
-      await setDoc(doc(offersCollection, peerId), { offer, from: clientId }).catch((err) =>
-        console.error("Error setting offer document:", err, "roomId:", roomId)
-      );
-    } catch (err) {
-      console.error("Error creating/sending offer:", err);
-    }
+    unsubscribeFunctions.current.push(unsubscribeOffers);
 
     // Listen for answers
     const answersCollection = collection(db, "rooms", roomId, "answers");
-    onSnapshot(
+    const unsubscribeAnswers = onSnapshot(
       doc(answersCollection, clientId),
-      (docSnap) => {
+      async (docSnap) => {
         try {
           const data = docSnap.data();
-          if (data?.answer && !pc.remoteDescription) {
+          if (data?.answer && data.from === peerId && !pc.remoteDescription) {
             console.log("Received answer from:", data.from);
-            pc.setRemoteDescription(new RTCSessionDescription(data.answer)).catch((err) =>
-              console.error("Error setting remote description:", err)
-            );
+            await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+            // Clean up the answer
+            await deleteDoc(doc(answersCollection, clientId));
           }
         } catch (err) {
           console.error("Error processing answer:", err);
         }
-      },
-      (err) => console.error("Snapshot error for answers:", err)
+      }
     );
+    unsubscribeFunctions.current.push(unsubscribeAnswers);
 
     // Listen for ICE candidates
     const candidatesCollection = collection(db, "rooms", roomId, "candidates");
-    onSnapshot(
+    const unsubscribeCandidates = onSnapshot(
       candidatesCollection,
       (snapshot) => {
         snapshot.docChanges().forEach(async (change) => {
           if (change.type === "added") {
             const data = change.doc.data();
-            if (data.to === clientId) {
-              console.log("Received ICE candidate from:", data.from, "candidate:", data.candidate);
-              await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch((err) =>
-                console.error("Error adding ICE candidate:", err)
-              );
+            if (data.to === clientId && data.from === peerId) {
+              console.log("Received ICE candidate from:", data.from);
+              try {
+                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                // Clean up the candidate
+                await deleteDoc(change.doc.ref);
+              } catch (err) {
+                console.error("Error adding ICE candidate:", err);
+              }
             }
           }
         });
-      },
-      (err) => console.error("Snapshot error for candidates:", err)
+      }
     );
+    unsubscribeFunctions.current.push(unsubscribeCandidates);
   };
 
   const startScreenShare = async () => {
     try {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
+        audio: true,
       });
       setIsSharingScreen(true);
-      const screenTrack = screenStream.getVideoTracks()[0];
+      
+      // Replace tracks in all peer connections
       Object.values(peerConnections.current).forEach((pc) => {
-        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-        if (sender && screenTrack) {
-          sender.replaceTrack(screenTrack);
-          console.log("Replaced video track with screen share for peer:", pc);
+        const videoSender = pc.getSenders().find((s) => s.track?.kind === "video");
+        const audioSender = pc.getSenders().find((s) => s.track?.kind === "audio");
+        
+        if (videoSender && screenStream.getVideoTracks()[0]) {
+          videoSender.replaceTrack(screenStream.getVideoTracks()[0]);
+        }
+        if (audioSender && screenStream.getAudioTracks()[0]) {
+          audioSender.replaceTrack(screenStream.getAudioTracks()[0]);
         }
       });
+      
       setLocalStream(screenStream);
-      screenTrack.onended = stopScreenShare;
+      screenStream.getVideoTracks()[0].onended = stopScreenShare;
     } catch (err) {
       console.error("Error sharing screen:", err);
     }
@@ -359,11 +386,17 @@ const VideoCall = () => {
       });
       console.log("Restored camera stream:", stream.id);
       setLocalStream(stream);
+      
+      // Replace tracks in all peer connections
       Object.values(peerConnections.current).forEach((pc) => {
-        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
-        if (sender && stream.getVideoTracks()[0]) {
-          sender.replaceTrack(stream.getVideoTracks()[0]);
-          console.log("Restored camera track for peer:", pc);
+        const videoSender = pc.getSenders().find((s) => s.track?.kind === "video");
+        const audioSender = pc.getSenders().find((s) => s.track?.kind === "audio");
+        
+        if (videoSender && stream.getVideoTracks()[0]) {
+          videoSender.replaceTrack(stream.getVideoTracks()[0]);
+        }
+        if (audioSender && stream.getAudioTracks()[0]) {
+          audioSender.replaceTrack(stream.getAudioTracks()[0]);
         }
       });
     } catch (err) {
@@ -397,6 +430,23 @@ const VideoCall = () => {
     });
   };
 
+  const leaveRoom = async () => {
+    if (clientId && roomId) {
+      try {
+        await deleteDoc(doc(db, "rooms", roomId, "participants", clientId));
+      } catch (err) {
+        console.error("Error leaving room:", err);
+      }
+    }
+  };
+
+  // Clean up when component unmounts
+  useEffect(() => {
+    return () => {
+      leaveRoom();
+    };
+  }, []);
+
   return (
     <div className="min-h-screen bg-gray-100 flex flex-col items-center p-4">
       <h1 className="text-3xl font-bold mb-4">MeetClone</h1>
@@ -428,6 +478,12 @@ const VideoCall = () => {
         >
           Record
         </button>
+        <button
+          className="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600"
+          onClick={leaveRoom}
+        >
+          Leave Room
+        </button>
       </div>
       <div className="grid grid-cols-2 gap-4 max-w-4xl">
         {localStream && (
@@ -438,14 +494,19 @@ const VideoCall = () => {
             </p>
           </div>
         )}
-        {remoteStreams.map((stream) => (
-          <div key={stream.id} className="relative">
+        {Array.from(remoteStreams.entries()).map(([peerId, stream]) => (
+          <div key={peerId} className="relative">
             <VideoPlayer stream={stream} muted={false} />
             <p className="absolute bottom-2 left-2 text-white bg-black bg-opacity-50 px-2 py-1 rounded">
-              Participant
+              Participant ({peerId.substring(0, 8)})
             </p>
           </div>
         ))}
+      </div>
+      <div className="mt-4 text-sm text-gray-600">
+        <p>Local Stream: {localStream ? "Connected" : "Not connected"}</p>
+        <p>Remote Streams: {remoteStreams.size}</p>
+        <p>Peer Connections: {Object.keys(peerConnections.current).length}</p>
       </div>
     </div>
   );
