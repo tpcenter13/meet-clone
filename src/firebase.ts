@@ -1,14 +1,20 @@
-import { initializeApp } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
+// src/firebase.ts
+import { initializeApp } from 'firebase/app';
+import { getFirestore } from 'firebase/firestore';
+import { getAuth } from 'firebase/auth';
 
+// Environment variables from your .env file
 const firebaseConfig = {
-  apiKey: "AIzaSyCHsPe-y9dI_ipUXhuDak6hdDpEigdzlZI",
-  authDomain: "webrtc-c2386.firebaseapp.com",
-  projectId: "webrtc-c2386",
-  storageBucket: "webrtc-c2386.firebasestorage.app",
-  messagingSenderId: "676061610225",
-  appId: "1:676061610225:web:902fbcbf93b9abd97d2950",
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
 const app = initializeApp(firebaseConfig);
+
 export const db = getFirestore(app);
+export const auth = getAuth(app);
+export default app;
