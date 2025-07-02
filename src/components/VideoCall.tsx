@@ -143,19 +143,19 @@ const VideoCall = () => {
       });
     };
 
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        console.log("Sending ICE candidate to:", peerId, "candidate:", event.candidate);
-        const candidatesCollection = collection(db, "rooms", roomId, "candidates");
-        addDoc(candidatesCollection, {
-          candidate: event.candidate,
-          to: peerId,
-          from: clientId,
-        }).catch((err) => console.error("Error sending ICE candidate:", err));
-      } else {
-        console.log("All ICE candidates gathered for:", peerId);
-      }
-    };
+pc.onicecandidate = (event) => {
+  if (event.candidate) {
+    console.log("Sending ICE candidate to:", peerId, "candidate:", event.candidate);
+    const candidatesCollection = collection(db, "rooms", roomId, "candidates");
+    addDoc(candidatesCollection, {
+      candidate: event.candidate,
+      to: peerId,
+      from: clientId,
+    }).catch((err) => console.error("Error sending ICE candidate:", err));
+  } else {
+    console.log("All ICE candidates gathered for:", peerId);
+  }
+};
 
     // Listen for incoming offers
     const offersCollection = collection(db, "rooms", roomId, "offers");
