@@ -67,7 +67,7 @@ const VideoCall = () => {
       try {
         // Mobile-friendly getUserMedia constraints
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" }, // Prefer front camera for mobile
+          video: { facingMode: "user" },
           audio: true,
         });
         console.log("Local stream initialized:", stream.id, "Client ID:", clientId);
@@ -88,9 +88,7 @@ const VideoCall = () => {
       if (localStream) {
         localStream.getTracks().forEach((track) => track.stop());
       }
-      Object.values(peerConnections.current).forEach((pc) => {
-        pc.close();
-      });
+      Object.values(peerConnections.current).forEach((pc) => pc.close());
       peerConnections.current = {};
     };
   }, []);
@@ -144,11 +142,15 @@ const VideoCall = () => {
     const pc = new RTCPeerConnection({
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
-        // Replace with your TURN server details
         {
-          urls: "turn:your-turn-server", // e.g., turn:turn.example.com
-          username: "your-username",
-          credential: "your-password",
+          urls: "turn:openrelay.metered.ca:80",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443",
+          username: "openrelayproject",
+          credential: "openrelayproject",
         },
       ],
     });
@@ -171,19 +173,30 @@ const VideoCall = () => {
         trackKind: event.track.kind,
         trackEnabled: event.track.enabled,
         trackReadyState: event.track.readyState,
+        active: stream.active,
+        tracks: stream.getTracks().map((t) => ({
+          kind: t.kind,
+          enabled: t.enabled,
+          readyState: t.readyState,
+        })),
       });
-      setRemoteStreams((prev) => {
-        const exists = prev.some((s) => s.id === stream.id);
-        if (!exists) {
-          console.log("Adding new remote stream:", stream.id);
-          return [...prev, stream];
-        }
-        return prev;
-      });
-      // Handle track end
+      if (stream.active && stream.getVideoTracks().length > 0) {
+        setRemoteStreams((prev) => {
+          const exists = prev.some((s) => s.id === stream.id);
+          if (!exists) {
+            console.log("Adding new remote stream:", stream.id);
+            return [...prev, stream];
+          }
+          return prev;
+        });
+      } else {
+        console.warn("Received inactive or no video stream:", stream.id);
+      }
       event.track.onended = () => {
         console.log("Track ended:", event.track.kind, event.track.id);
-        setRemoteStreams((prev) => prev.filter((s) => s.getTracks().some((t) => t.readyState === "live")));
+        setRemoteStreams((prev) =>
+          prev.filter((s) => s.getVideoTracks().some((t) => t.readyState === "live"))
+        );
       };
     };
 
@@ -202,13 +215,18 @@ const VideoCall = () => {
       }
     };
 
-    // Log connection state
+    // Monitor peer connection state
     pc.onconnectionstatechange = () => {
       console.log("Peer connection state for", peerId, ":", pc.connectionState);
-      if (pc.connectionState === "failed") {
+      if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
         console.error("Peer connection failed for", peerId);
         pc.close();
         delete peerConnections.current[peerId];
+        setRemoteStreams((prev) =>
+          prev.filter((s) => s.getVideoTracks().some((t) => t.readyState === "live"))
+        );
+      } else if (pc.connectionState === "connected") {
+        console.log("Peer connection established with", peerId);
       }
     };
 
@@ -218,8 +236,11 @@ const VideoCall = () => {
         console.error("Peer connection timeout for", peerId);
         pc.close();
         delete peerConnections.current[peerId];
+        setRemoteStreams((prev) =>
+          prev.filter((s) => s.getVideoTracks().some((t) => t.readyState === "live"))
+        );
       }
-    }, 30000); // 30 seconds
+    }, 30000);
 
     pc.onconnectionstatechange = () => {
       console.log("Peer connection state for", peerId, ":", pc.connectionState);
@@ -242,9 +263,7 @@ const VideoCall = () => {
             await pc.setLocalDescription(answer);
             const answersCollection = collection(db, "rooms", roomId, "answers");
             await setDoc(doc(answersCollection, data.from), { answer, from: clientId });
-           
-
- console.log("Sent answer to:", data.from);
+            console.log("Sent answer to:", data.from);
           }
         } catch (err) {
           console.error("Error processing offer:", err);
@@ -315,7 +334,7 @@ const VideoCall = () => {
       setIsSharingScreen(true);
       const screenTrack = screenStream.getVideoTracks()[0];
       Object.values(peerConnections.current).forEach((pc) => {
-        const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
         if (sender && screenTrack) {
           sender.replaceTrack(screenTrack);
           console.log("Replaced video track with screen share for peer:", pc);
@@ -341,7 +360,7 @@ const VideoCall = () => {
       console.log("Restored camera stream:", stream.id);
       setLocalStream(stream);
       Object.values(peerConnections.current).forEach((pc) => {
-        const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
         if (sender && stream.getVideoTracks()[0]) {
           sender.replaceTrack(stream.getVideoTracks()[0]);
           console.log("Restored camera track for peer:", pc);
