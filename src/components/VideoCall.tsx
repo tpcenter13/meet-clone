@@ -16,11 +16,12 @@ const VideoPlayer = ({ stream, muted }: { stream: MediaStream; muted: boolean })
 
   useEffect(() => {
     if (videoRef.current && stream) {
-      console.log("Setting video stream for:", stream.id);
+      console.log("Setting video stream for:", stream.id, "active:", stream.active);
       videoRef.current.srcObject = stream;
       videoRef.current
         .play()
-        .catch((err) => console.error("Video play error:", err));
+        .then(() => console.log("Video playback started for stream:", stream.id))
+        .catch((err) => console.error("Video play error for stream:", stream.id, err));
     }
   }, [stream]);
 
@@ -60,55 +61,77 @@ const VideoCall = () => {
         id = `meet-${Math.random().toString(36).substring(2, 9)}`;
         setSearchParams({ room: id });
       }
-      console.log("Setting roomId:", id); // Debug log
-      setRoomId(id); // Set roomId immediately
+      console.log("Setting roomId:", id);
+      setRoomId(id);
+
       try {
+        // Mobile-friendly getUserMedia constraints
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
+          video: { facingMode: "user" }, // Prefer front camera for mobile
           audio: true,
         });
         console.log("Local stream initialized:", stream.id, "Client ID:", clientId);
+        stream.getTracks().forEach((track) => {
+          console.log("Local track:", track.kind, track.readyState, track.enabled);
+        });
         setLocalStream(stream);
-        await joinRoom(id); // Pass roomId explicitly
+        await joinRoom(id);
       } catch (err) {
         console.error("Error accessing media devices:", err);
       }
     };
     initRoom();
 
+    // Cleanup
     return () => {
-      console.log("Cleaning up local stream");
-      localStream?.getTracks().forEach((track) => track.stop());
-      Object.values(peerConnections.current).forEach((pc) => pc.close());
+      console.log("Cleaning up local stream and peer connections");
+      if (localStream) {
+        localStream.getTracks().forEach((track) => track.stop());
+      }
+      Object.values(peerConnections.current).forEach((pc) => {
+        pc.close();
+      });
+      peerConnections.current = {};
     };
   }, []);
 
   const joinRoom = async (roomId: string) => {
-    const roomRef = doc(db, "rooms", roomId);
-    const roomSnapshot = await getDoc(roomRef);
-
-    if (!roomSnapshot.exists()) {
-      console.log("Creating new room:", roomId);
-      await setDoc(roomRef, { participants: [] });
+    if (!roomId) {
+      console.error("No roomId provided");
+      return;
     }
+    const roomRef = doc(db, "rooms", roomId);
+    try {
+      const roomSnapshot = await getDoc(roomRef);
+      if (!roomSnapshot.exists()) {
+        console.log("Creating new room:", roomId);
+        await setDoc(roomRef, { participants: [] });
+      }
 
-    const participantsCollection = collection(db, "rooms", roomId, "participants");
-    onSnapshot(participantsCollection, (snapshot) => {
-      snapshot.docChanges().forEach(async (change) => {
-        if (change.type === "added") {
-          const data = change.doc.data();
-          if (data?.id !== clientId && !peerConnections.current[data?.id || ""]) {
-            console.log("Participant change detected:", data);
-            await createPeerConnection(data?.id || "", roomRef, roomId); // Pass roomId explicitly
-          }
+      const participantsCollection = collection(db, "rooms", roomId, "participants");
+      onSnapshot(
+        participantsCollection,
+        (snapshot) => {
+          snapshot.docChanges().forEach(async (change) => {
+            if (change.type === "added") {
+              const data = change.doc.data();
+              if (data?.id !== clientId && !peerConnections.current[data?.id || ""]) {
+                console.log("Participant change detected:", data);
+                await createPeerConnection(data?.id || "", roomRef, roomId);
+              }
+            }
+          });
+        },
+        (error) => {
+          console.error("Snapshot error for participants:", error);
         }
-      });
-    }, (error) => {
-      console.error("Snapshot error:", error);
-    });
+      );
 
-    console.log("Adding client to participants:", clientId);
-    await setDoc(doc(participantsCollection, clientId), { id: clientId });
+      console.log("Adding client to participants:", clientId);
+      await setDoc(doc(participantsCollection, clientId), { id: clientId });
+    } catch (err) {
+      console.error("Error joining room:", err);
+    }
   };
 
   const createPeerConnection = async (peerId: string, roomRef: any, roomId: string) => {
@@ -117,22 +140,38 @@ const VideoCall = () => {
       console.error("Invalid roomId detected:", roomId);
       return;
     }
+
     const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        // Replace with your TURN server details
+        {
+          urls: "turn:your-turn-server", // e.g., turn:turn.example.com
+          username: "your-username",
+          credential: "your-password",
+        },
+      ],
     });
 
     peerConnections.current[peerId] = pc;
 
+    // Add local stream tracks
     if (localStream) {
       localStream.getTracks().forEach((track) => {
-        console.log("Adding track to peer connection:", track.kind);
+        console.log("Adding track to peer connection:", track.kind, track.id, track.readyState);
         pc.addTrack(track, localStream);
       });
     }
 
+    // Handle incoming tracks
     pc.ontrack = (event) => {
       const stream = event.streams[0];
-      console.log("ontrack event fired for stream:", stream.id, "tracks:", event.track);
+      console.log("ontrack event:", {
+        streamId: stream.id,
+        trackKind: event.track.kind,
+        trackEnabled: event.track.enabled,
+        trackReadyState: event.track.readyState,
+      });
       setRemoteStreams((prev) => {
         const exists = prev.some((s) => s.id === stream.id);
         if (!exists) {
@@ -141,77 +180,131 @@ const VideoCall = () => {
         }
         return prev;
       });
+      // Handle track end
+      event.track.onended = () => {
+        console.log("Track ended:", event.track.kind, event.track.id);
+        setRemoteStreams((prev) => prev.filter((s) => s.getTracks().some((t) => t.readyState === "live")));
+      };
     };
 
-pc.onicecandidate = (event) => {
-  if (event.candidate) {
-    console.log("Sending ICE candidate to:", peerId, "candidate:", event.candidate);
-    const candidatesCollection = collection(db, "rooms", roomId, "candidates");
-    addDoc(candidatesCollection, {
-      candidate: event.candidate,
-      to: peerId,
-      from: clientId,
-    }).catch((err) => console.error("Error sending ICE candidate:", err));
-  } else {
-    console.log("All ICE candidates gathered for:", peerId);
-  }
-};
+    // Handle ICE candidates
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        console.log("Sending ICE candidate to:", peerId, "type:", event.candidate.type);
+        const candidatesCollection = collection(db, "rooms", roomId, "candidates");
+        addDoc(candidatesCollection, {
+          candidate: event.candidate,
+          to: peerId,
+          from: clientId,
+        }).catch((err) => console.error("Error sending ICE candidate:", err));
+      } else {
+        console.log("All ICE candidates gathered for:", peerId);
+      }
+    };
+
+    // Log connection state
+    pc.onconnectionstatechange = () => {
+      console.log("Peer connection state for", peerId, ":", pc.connectionState);
+      if (pc.connectionState === "failed") {
+        console.error("Peer connection failed for", peerId);
+        pc.close();
+        delete peerConnections.current[peerId];
+      }
+    };
+
+    // Timeout for stalled connections
+    const timeout = setTimeout(() => {
+      if (pc.connectionState !== "connected") {
+        console.error("Peer connection timeout for", peerId);
+        pc.close();
+        delete peerConnections.current[peerId];
+      }
+    }, 30000); // 30 seconds
+
+    pc.onconnectionstatechange = () => {
+      console.log("Peer connection state for", peerId, ":", pc.connectionState);
+      if (pc.connectionState === "connected") {
+        clearTimeout(timeout);
+      }
+    };
 
     // Listen for incoming offers
     const offersCollection = collection(db, "rooms", roomId, "offers");
-    onSnapshot(doc(offersCollection, clientId), async (docSnap) => {
-      const data = docSnap.data();
-      if (data?.offer && !pc.remoteDescription) {
-        console.log("Received offer from:", data.from);
-        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        const answersCollection = collection(db, "rooms", roomId, "answers");
-        await setDoc(doc(answersCollection, data.from), { answer, from: clientId });
-        console.log("Sent answer to:", data.from);
-      }
-    });
+    onSnapshot(
+      doc(offersCollection, clientId),
+      async (docSnap) => {
+        try {
+          const data = docSnap.data();
+          if (data?.offer && !pc.remoteDescription) {
+            console.log("Received offer from:", data.from);
+            await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            const answersCollection = collection(db, "rooms", roomId, "answers");
+            await setDoc(doc(answersCollection, data.from), { answer, from: clientId });
+           
+
+ console.log("Sent answer to:", data.from);
+          }
+        } catch (err) {
+          console.error("Error processing offer:", err);
+        }
+      },
+      (err) => console.error("Snapshot error for offers:", err)
+    );
 
     // Create and send offer
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       console.log("Created and sent offer for:", peerId, "in room:", roomId);
-      const offersCollection = collection(db, "rooms", roomId, "offers"); // Re-declare to ensure correct roomId
+      const offersCollection = collection(db, "rooms", roomId, "offers");
       await setDoc(doc(offersCollection, peerId), { offer, from: clientId }).catch((err) =>
         console.error("Error setting offer document:", err, "roomId:", roomId)
       );
     } catch (err) {
-      console.error("Error creating/sending offer:", err, "roomId:", roomId);
+      console.error("Error creating/sending offer:", err);
     }
 
     // Listen for answers
     const answersCollection = collection(db, "rooms", roomId, "answers");
-    onSnapshot(doc(answersCollection, clientId), (docSnap) => {
-      const data = docSnap.data();
-      if (data?.answer && !pc.remoteDescription) {
-        console.log("Received answer from:", data.from);
-        pc.setRemoteDescription(new RTCSessionDescription(data.answer)).catch(
-          (err) => console.error("Error setting remote description:", err)
-        );
-      }
-    });
+    onSnapshot(
+      doc(answersCollection, clientId),
+      (docSnap) => {
+        try {
+          const data = docSnap.data();
+          if (data?.answer && !pc.remoteDescription) {
+            console.log("Received answer from:", data.from);
+            pc.setRemoteDescription(new RTCSessionDescription(data.answer)).catch((err) =>
+              console.error("Error setting remote description:", err)
+            );
+          }
+        } catch (err) {
+          console.error("Error processing answer:", err);
+        }
+      },
+      (err) => console.error("Snapshot error for answers:", err)
+    );
 
     // Listen for ICE candidates
     const candidatesCollection = collection(db, "rooms", roomId, "candidates");
-    onSnapshot(candidatesCollection, (snapshot) => {
-      snapshot.docChanges().forEach(async (change) => {
-        if (change.type === "added") {
-          const data = change.doc.data();
-          if (data.to === clientId) {
-            console.log("Received ICE candidate from:", data.from);
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(
-              (err) => console.error("Error adding ICE candidate:", err)
-            );
+    onSnapshot(
+      candidatesCollection,
+      (snapshot) => {
+        snapshot.docChanges().forEach(async (change) => {
+          if (change.type === "added") {
+            const data = change.doc.data();
+            if (data.to === clientId) {
+              console.log("Received ICE candidate from:", data.from, "candidate:", data.candidate);
+              await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch((err) =>
+                console.error("Error adding ICE candidate:", err)
+              );
+            }
           }
-        }
-      });
-    });
+        });
+      },
+      (err) => console.error("Snapshot error for candidates:", err)
+    );
   };
 
   const startScreenShare = async () => {
@@ -225,6 +318,7 @@ pc.onicecandidate = (event) => {
         const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
         if (sender && screenTrack) {
           sender.replaceTrack(screenTrack);
+          console.log("Replaced video track with screen share for peer:", pc);
         }
       });
       setLocalStream(screenStream);
@@ -241,14 +335,16 @@ pc.onicecandidate = (event) => {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
+        video: { facingMode: "user" },
         audio: true,
       });
+      console.log("Restored camera stream:", stream.id);
       setLocalStream(stream);
       Object.values(peerConnections.current).forEach((pc) => {
         const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
         if (sender && stream.getVideoTracks()[0]) {
           sender.replaceTrack(stream.getVideoTracks()[0]);
+          console.log("Restored camera track for peer:", pc);
         }
       });
     } catch (err) {
