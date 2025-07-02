@@ -18,7 +18,9 @@ const VideoPlayer = ({ stream, muted }: { stream: MediaStream; muted: boolean })
     if (videoRef.current && stream) {
       console.log("Setting video stream for:", stream.id);
       videoRef.current.srcObject = stream;
-      videoRef.current.play().catch((err) => console.error("Video play error:", err));
+      videoRef.current
+        .play()
+        .catch((err) => console.error("Video play error:", err));
     }
   }, [stream]);
 
@@ -41,7 +43,7 @@ const VideoCall = () => {
   const peerConnections = useRef<Record<string, RTCPeerConnection>>({});
   const [searchParams, setSearchParams] = useSearchParams();
 
-  // Generate a unique clientId using a more robust method
+  // Generate a unique clientId
   const clientId = useRef(
     crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`
   ).current;
@@ -58,7 +60,8 @@ const VideoCall = () => {
         id = `meet-${Math.random().toString(36).substring(2, 9)}`;
         setSearchParams({ room: id });
       }
-      setRoomId(id);
+      console.log("Setting roomId:", id); // Debug log
+      setRoomId(id); // Set roomId immediately
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: true,
@@ -66,7 +69,7 @@ const VideoCall = () => {
         });
         console.log("Local stream initialized:", stream.id, "Client ID:", clientId);
         setLocalStream(stream);
-        await joinRoom(id);
+        await joinRoom(id); // Pass roomId explicitly
       } catch (err) {
         console.error("Error accessing media devices:", err);
       }
@@ -80,35 +83,40 @@ const VideoCall = () => {
     };
   }, []);
 
-  const joinRoom = async (id: string) => {
-    const roomRef = doc(db, "rooms", id);
+  const joinRoom = async (roomId: string) => {
+    const roomRef = doc(db, "rooms", roomId);
     const roomSnapshot = await getDoc(roomRef);
 
     if (!roomSnapshot.exists()) {
-      console.log("Creating new room:", id);
+      console.log("Creating new room:", roomId);
       await setDoc(roomRef, { participants: [] });
     }
 
-    const participantsCollection = collection(db, "rooms", id, "participants");
+    const participantsCollection = collection(db, "rooms", roomId, "participants");
     onSnapshot(participantsCollection, (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === "added") {
           const data = change.doc.data();
-          console.log("Participant change detected:", data);
-          if (data?.id !== clientId) {
-            console.log("Creating peer connection for:", data.id);
-            await createPeerConnection(data?.id || "", roomRef);
+          if (data?.id !== clientId && !peerConnections.current[data?.id || ""]) {
+            console.log("Participant change detected:", data);
+            await createPeerConnection(data?.id || "", roomRef, roomId); // Pass roomId explicitly
           }
         }
       });
+    }, (error) => {
+      console.error("Snapshot error:", error);
     });
 
     console.log("Adding client to participants:", clientId);
     await setDoc(doc(participantsCollection, clientId), { id: clientId });
   };
 
-  const createPeerConnection = async (peerId: string, roomRef: any) => {
-    console.log("Initializing peer connection for:", peerId);
+  const createPeerConnection = async (peerId: string, roomRef: any, roomId: string) => {
+    console.log("Initializing peer connection for:", peerId, "with roomId:", roomId);
+    if (!roomId || typeof roomId !== "string") {
+      console.error("Invalid roomId detected:", roomId);
+      return;
+    }
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
     });
@@ -124,7 +132,7 @@ const VideoCall = () => {
 
     pc.ontrack = (event) => {
       const stream = event.streams[0];
-      console.log("Received remote stream:", stream.id);
+      console.log("ontrack event fired for stream:", stream.id, "tracks:", event.track);
       setRemoteStreams((prev) => {
         const exists = prev.some((s) => s.id === stream.id);
         if (!exists) {
@@ -137,13 +145,15 @@ const VideoCall = () => {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log("Sending ICE candidate to:", peerId);
+        console.log("Sending ICE candidate to:", peerId, "candidate:", event.candidate);
         const candidatesCollection = collection(db, "rooms", roomId, "candidates");
         addDoc(candidatesCollection, {
           candidate: event.candidate,
           to: peerId,
           from: clientId,
         }).catch((err) => console.error("Error sending ICE candidate:", err));
+      } else {
+        console.log("All ICE candidates gathered for:", peerId);
       }
     };
 
@@ -166,10 +176,13 @@ const VideoCall = () => {
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      console.log("Created and sent offer for:", peerId);
-      await setDoc(doc(offersCollection, peerId), { offer, from: clientId });
+      console.log("Created and sent offer for:", peerId, "in room:", roomId);
+      const offersCollection = collection(db, "rooms", roomId, "offers"); // Re-declare to ensure correct roomId
+      await setDoc(doc(offersCollection, peerId), { offer, from: clientId }).catch((err) =>
+        console.error("Error setting offer document:", err, "roomId:", roomId)
+      );
     } catch (err) {
-      console.error("Error creating/sending offer:", err);
+      console.error("Error creating/sending offer:", err, "roomId:", roomId);
     }
 
     // Listen for answers
@@ -209,9 +222,7 @@ const VideoCall = () => {
       setIsSharingScreen(true);
       const screenTrack = screenStream.getVideoTracks()[0];
       Object.values(peerConnections.current).forEach((pc) => {
-        const sender = pc.getSenders().find(
-          (s) => s.track && s.track.kind === "video"
-        );
+        const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
         if (sender && screenTrack) {
           sender.replaceTrack(screenTrack);
         }
@@ -235,9 +246,7 @@ const VideoCall = () => {
       });
       setLocalStream(stream);
       Object.values(peerConnections.current).forEach((pc) => {
-        const sender = pc.getSenders().find(
-          (s) => s.track && s.track.kind === "video"
-        );
+        const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
         if (sender && stream.getVideoTracks()[0]) {
           sender.replaceTrack(stream.getVideoTracks()[0]);
         }
