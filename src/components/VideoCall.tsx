@@ -10,23 +10,28 @@ import {
   deleteDoc,
   query,
   where,
+  Unsubscribe,
 } from "firebase/firestore";
 import { useSearchParams } from "react-router-dom";
 
 // VideoPlayer Component
-const VideoPlayer = ({ stream, muted }: { stream: MediaStream; muted: boolean }) => {
+interface VideoPlayerProps {
+  stream: MediaStream;
+  muted: boolean;
+}
+
+const VideoPlayer: React.FC<VideoPlayerProps> = ({ stream, muted }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
     if (videoRef.current && stream && stream.active) {
       console.log("Setting video stream for:", stream.id, "active:", stream.active);
       videoRef.current.srcObject = stream;
-      // Ensure video element is loaded before playing
       videoRef.current.onloadedmetadata = () => {
         videoRef.current
           ?.play()
           .then(() => console.log("Video playback started for stream:", stream.id))
-          .catch((err) => console.error("Video play error for stream:", stream.id, err));
+          .catch((err: Error) => console.error("Video play error for stream:", stream.id, err));
       };
     }
   }, [stream]);
@@ -37,29 +42,43 @@ const VideoPlayer = ({ stream, muted }: { stream: MediaStream; muted: boolean })
       autoPlay
       playsInline
       muted={muted}
-      className="w-full h-64 bg-black rounded"
+      className="w-full h-full bg-black rounded object-cover"
     />
   );
 };
 
-const VideoCall = () => {
+const VideoCall: React.FC = () => {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
-  const [isSharingScreen, setIsSharingScreen] = useState(false);
+  const [isSharingScreen, setIsSharingScreen] = useState<boolean>(false);
   const [roomId, setRoomId] = useState<string>("");
   const [participants, setParticipants] = useState<Set<string>>(new Set());
+  const [messages, setMessages] = useState<
+    { id: string; text: string; senderId: string; senderName: string; timestamp: string; type?: string }[]
+  >([]);
+  const [newMessage, setNewMessage] = useState<string>("");
+  const [selectedEmotion, setSelectedEmotion] = useState<string | null>(null);
   const peerConnections = useRef<Record<string, RTCPeerConnection>>({});
+  const dataChannels = useRef<Record<string, RTCDataChannel>>({});
   const [searchParams, setSearchParams] = useSearchParams();
   const unsubscribeFunctions = useRef<(() => void)[]>([]);
-  const isInitialized = useRef(false);
+  const isInitialized = useRef<boolean>(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Generate a unique clientId
-  const clientId = useRef(crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`)
-    .current;
+  const clientId = useRef<string>(
+    crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`
+  ).current;
+
+  const emotions = ["Sad", "Happy", "Anxious", "Angry", "Fear", "Disgust"];
 
   useEffect(() => {
     console.log("Initialized with clientId:", clientId);
   }, [clientId]);
+
+  // Scroll to the bottom of the chat when new messages arrive
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   // Initialize room and media
   useEffect(() => {
@@ -83,7 +102,7 @@ const VideoCall = () => {
         console.log("Local stream initialized:", stream.id, "Client ID:", clientId);
         setLocalStream(stream);
         await joinRoom(id, stream);
-      } catch (err) {
+      } catch (err: unknown) {
         console.error("Error accessing media devices:", err);
         try {
           const audioStream = await navigator.mediaDevices.getUserMedia({
@@ -93,7 +112,7 @@ const VideoCall = () => {
           setLocalStream(audioStream);
           await joinRoom(id, audioStream);
           alert("Camera access failed. Proceeding with audio only.");
-        } catch (audioErr) {
+        } catch (audioErr: unknown) {
           console.error("Error accessing audio-only stream:", audioErr);
           alert("Unable to access camera or microphone. Please check permissions.");
         }
@@ -102,17 +121,19 @@ const VideoCall = () => {
     initRoom();
 
     return () => {
-      console.log("Cleaning up local stream and peer connections");
+      console.log("Cleaning up local stream, peer connections, and subscriptions");
       if (localStream) {
-        localStream.getTracks().forEach((track) => track.stop());
+        localStream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
       }
-      Object.values(peerConnections.current).forEach((pc) => pc.close());
+      Object.values(peerConnections.current).forEach((pc: RTCPeerConnection) => pc.close());
+      Object.values(dataChannels.current).forEach((dc: RTCDataChannel) => dc.close());
       peerConnections.current = {};
-      unsubscribeFunctions.current.forEach((unsubscribe) => unsubscribe());
+      dataChannels.current = {};
+      unsubscribeFunctions.current.forEach((unsubscribe: () => void) => unsubscribe());
       unsubscribeFunctions.current = [];
       leaveRoom();
     };
-  }, []);
+  }, [clientId, localStream, searchParams, setSearchParams]);
 
   const joinRoom = async (roomId: string, stream: MediaStream) => {
     if (!roomId) {
@@ -134,19 +155,16 @@ const VideoCall = () => {
         joinedAt: new Date().toISOString(),
       });
 
-      // Setup listeners first
       await setupIncomingConnectionListener(roomId, stream);
 
-      // Then listen for participants
-      const unsubscribeParticipants = onSnapshot(participantsCollection, (snapshot) => {
+      const unsubscribeParticipants: Unsubscribe = onSnapshot(participantsCollection, (snapshot) => {
         const currentParticipants = new Set<string>();
         const newParticipants: string[] = [];
 
-        snapshot.docs.forEach((doc) => {
+        snapshot.forEach((doc) => {
           const data = doc.data();
           if (data?.id && data.id !== clientId) {
             currentParticipants.add(data.id);
-            // Check if this is a new participant
             if (!participants.has(data.id)) {
               newParticipants.push(data.id);
             }
@@ -156,17 +174,15 @@ const VideoCall = () => {
         console.log("Current participants:", Array.from(currentParticipants));
         console.log("New participants:", newParticipants);
 
-        // Handle new participants - only initiate if we have a lower ID (to avoid duplicate connections)
-        newParticipants.forEach(async (participantId) => {
+        newParticipants.forEach(async (participantId: string) => {
           if (!peerConnections.current[participantId]) {
-            const shouldInitiate = clientId < participantId; // Deterministic way to decide who initiates
+            const shouldInitiate = clientId < participantId;
             console.log("New participant detected:", participantId, "shouldInitiate:", shouldInitiate);
             await createPeerConnection(participantId, roomId, stream, shouldInitiate);
           }
         });
 
-        // Handle participants who left
-        participants.forEach((participantId) => {
+        participants.forEach((participantId: string) => {
           if (!currentParticipants.has(participantId)) {
             console.log("Participant left:", participantId);
             cleanupPeerConnection(participantId);
@@ -176,8 +192,7 @@ const VideoCall = () => {
         setParticipants(currentParticipants);
       });
       unsubscribeFunctions.current.push(unsubscribeParticipants);
-
-    } catch (err) {
+    } catch (err: unknown) {
       console.error("Error joining room:", err);
     }
   };
@@ -186,15 +201,14 @@ const VideoCall = () => {
     const offersCollection = collection(db, "rooms", roomId, "offers");
     const offerQuery = query(offersCollection, where("to", "==", clientId));
 
-    const unsubscribeOffers = onSnapshot(offerQuery, (snapshot) => {
+    const unsubscribeOffers: Unsubscribe = onSnapshot(offerQuery, (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === "added") {
           const data = change.doc.data();
-          const fromId = data.from;
+          const fromId: string = data.from;
           console.log("Received offer from:", fromId);
-          
+
           if (fromId && fromId !== clientId) {
-            // Create peer connection if it doesn't exist
             if (!peerConnections.current[fromId]) {
               await createPeerConnection(fromId, roomId, stream, false);
             }
@@ -233,7 +247,32 @@ const VideoCall = () => {
 
     peerConnections.current[peerId] = pc;
 
-    pc.ontrack = (event) => {
+    // Create data channel for chat and emotions
+    let dataChannel: RTCDataChannel | null = null;
+    if (shouldInitiate) {
+      dataChannel = pc.createDataChannel("chat");
+      dataChannels.current[peerId] = dataChannel;
+      dataChannel.onopen = () => console.log(`Data channel opened with ${peerId}`);
+      dataChannel.onclose = () => console.log(`Data channel closed with ${peerId}`);
+      dataChannel.onmessage = (event: MessageEvent) => {
+        const message = JSON.parse(event.data);
+        setMessages((prev) => [...prev, message]);
+      };
+    }
+
+    // Handle incoming data channels
+    pc.ondatachannel = (event: RTCDataChannelEvent) => {
+      dataChannel = event.channel;
+      dataChannels.current[peerId] = dataChannel;
+      dataChannel.onmessage = (event: MessageEvent) => {
+        const message = JSON.parse(event.data);
+        setMessages((prev) => [...prev, message]);
+      };
+      dataChannel.onopen = () => console.log(`Data channel opened with ${peerId}`);
+      dataChannel.onclose = () => console.log(`Data channel closed with ${peerId}`);
+    };
+
+    pc.ontrack = (event: RTCTrackEvent) => {
       console.log("Received track from peer:", peerId, "kind:", event.track.kind);
       if (event.streams && event.streams[0]) {
         const remoteStream = event.streams[0];
@@ -246,15 +285,14 @@ const VideoCall = () => {
       }
     };
 
-    // Add local stream tracks
     if (stream) {
-      stream.getTracks().forEach((track) => {
+      stream.getTracks().forEach((track: MediaStreamTrack) => {
         console.log("Adding local track to peer connection:", track.kind, "for peer:", peerId);
         pc.addTrack(track, stream);
       });
     }
 
-    pc.onicecandidate = (event) => {
+    pc.onicecandidate = (event: RTCPeerConnectionIceEvent) => {
       if (event.candidate) {
         console.log("Sending ICE candidate to:", peerId);
         const candidatesCollection = collection(db, "rooms", roomId, "candidates");
@@ -267,7 +305,7 @@ const VideoCall = () => {
           },
           to: peerId,
           from: clientId,
-        }).catch((err) => console.error("Error sending ICE candidate:", err));
+        }).catch((err: Error) => console.error("Error sending ICE candidate:", err));
       }
     };
 
@@ -281,10 +319,8 @@ const VideoCall = () => {
       }
     };
 
-    // Setup signaling listeners for this peer
     await setupSignalingListeners(pc, peerId, roomId);
 
-    // Create and send offer if we should initiate
     if (shouldInitiate) {
       try {
         console.log("Creating offer for peer:", peerId);
@@ -293,7 +329,7 @@ const VideoCall = () => {
           offerToReceiveVideo: true,
         });
         await pc.setLocalDescription(offer);
-        
+
         const offersCollection = collection(db, "rooms", roomId, "offers");
         await addDoc(offersCollection, {
           offer: offer,
@@ -302,7 +338,7 @@ const VideoCall = () => {
           timestamp: new Date().toISOString(),
         });
         console.log("Sent offer to:", peerId);
-      } catch (err) {
+      } catch (err: unknown) {
         console.error("Error creating/sending offer:", err);
       }
     }
@@ -318,10 +354,10 @@ const VideoCall = () => {
     try {
       console.log("Handling offer from:", fromId);
       await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-      
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      
+
       const answersCollection = collection(db, "rooms", roomId, "answers");
       await addDoc(answersCollection, {
         answer: answer,
@@ -329,12 +365,11 @@ const VideoCall = () => {
         to: fromId,
         timestamp: new Date().toISOString(),
       });
-      
+
       console.log("Sent answer to:", fromId);
-      
-      // Clean up the offer document
+
       await deleteDoc(doc(db, "rooms", roomId, "offers", docId));
-    } catch (err) {
+    } catch (err: unknown) {
       console.error("Error handling incoming offer:", err);
     }
   };
@@ -342,11 +377,10 @@ const VideoCall = () => {
   const setupSignalingListeners = async (pc: RTCPeerConnection, peerId: string, roomId: string) => {
     const pendingCandidates: RTCIceCandidate[] = [];
 
-    // Listen for answers
     const answersCollection = collection(db, "rooms", roomId, "answers");
     const answerQuery = query(answersCollection, where("to", "==", clientId), where("from", "==", peerId));
 
-    const unsubscribeAnswers = onSnapshot(answerQuery, (snapshot) => {
+    const unsubscribeAnswers: Unsubscribe = onSnapshot(answerQuery, (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === "added") {
           const data = change.doc.data();
@@ -354,8 +388,7 @@ const VideoCall = () => {
             console.log("Received answer from:", peerId);
             await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
             console.log("Set remote description from answer:", peerId);
-            
-            // Process any pending candidates
+
             while (pendingCandidates.length > 0) {
               const candidate = pendingCandidates.shift();
               if (candidate) {
@@ -363,10 +396,9 @@ const VideoCall = () => {
                 console.log("Added queued ICE candidate from:", peerId);
               }
             }
-            
-            // Clean up the answer document
+
             await deleteDoc(change.doc.ref);
-          } catch (err) {
+          } catch (err: unknown) {
             console.error("Error processing answer:", err);
           }
         }
@@ -374,11 +406,10 @@ const VideoCall = () => {
     });
     unsubscribeFunctions.current.push(unsubscribeAnswers);
 
-    // Listen for ICE candidates
     const candidatesCollection = collection(db, "rooms", roomId, "candidates");
     const candidateQuery = query(candidatesCollection, where("to", "==", clientId), where("from", "==", peerId));
 
-    const unsubscribeCandidates = onSnapshot(candidateQuery, (snapshot) => {
+    const unsubscribeCandidates: Unsubscribe = onSnapshot(candidateQuery, (snapshot) => {
       snapshot.docChanges().forEach(async (change) => {
         if (change.type === "added") {
           const data = change.doc.data();
@@ -389,7 +420,7 @@ const VideoCall = () => {
               sdpMid: data.candidate.sdpMid,
               usernameFragment: data.candidate.usernameFragment,
             });
-            
+
             if (pc.remoteDescription) {
               await pc.addIceCandidate(candidate);
               console.log("Added ICE candidate from:", peerId);
@@ -397,10 +428,9 @@ const VideoCall = () => {
               console.log("Queuing ICE candidate for:", peerId);
               pendingCandidates.push(candidate);
             }
-            
-            // Clean up the candidate document
+
             await deleteDoc(change.doc.ref);
-          } catch (err) {
+          } catch (err: unknown) {
             console.error("Error adding ICE candidate:", err);
           }
         }
@@ -413,6 +443,10 @@ const VideoCall = () => {
     if (peerConnections.current[peerId]) {
       peerConnections.current[peerId].close();
       delete peerConnections.current[peerId];
+    }
+    if (dataChannels.current[peerId]) {
+      dataChannels.current[peerId].close();
+      delete dataChannels.current[peerId];
     }
     setRemoteStreams((prev) => {
       const newMap = new Map(prev);
@@ -428,9 +462,9 @@ const VideoCall = () => {
         audio: true,
       });
       setIsSharingScreen(true);
-      Object.values(peerConnections.current).forEach((pc) => {
-        const videoSender = pc.getSenders().find((s) => s.track?.kind === "video");
-        const audioSender = pc.getSenders().find((s) => s.track?.kind === "audio");
+      Object.values(peerConnections.current).forEach((pc: RTCPeerConnection) => {
+        const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === "video");
+        const audioSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === "audio");
         if (videoSender && screenStream.getVideoTracks()[0]) {
           videoSender.replaceTrack(screenStream.getVideoTracks()[0]);
         }
@@ -440,7 +474,7 @@ const VideoCall = () => {
       });
       setLocalStream(screenStream);
       screenStream.getVideoTracks()[0].onended = stopScreenShare;
-    } catch (err) {
+    } catch (err: unknown) {
       console.error("Error sharing screen:", err);
     }
   };
@@ -448,7 +482,7 @@ const VideoCall = () => {
   const stopScreenShare = async () => {
     setIsSharingScreen(false);
     if (localStream) {
-      localStream.getTracks().forEach((track) => track.stop());
+      localStream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -457,9 +491,9 @@ const VideoCall = () => {
       });
       console.log("Restored camera stream:", stream.id);
       setLocalStream(stream);
-      Object.values(peerConnections.current).forEach((pc) => {
-        const videoSender = pc.getSenders().find((s) => s.track?.kind === "video");
-        const audioSender = pc.getSenders().find((s) => s.track?.kind === "audio");
+      Object.values(peerConnections.current).forEach((pc: RTCPeerConnection) => {
+        const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === "video");
+        const audioSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === "audio");
         if (videoSender && stream.getVideoTracks()[0]) {
           videoSender.replaceTrack(stream.getVideoTracks()[0]);
         }
@@ -467,7 +501,7 @@ const VideoCall = () => {
           audioSender.replaceTrack(stream.getAudioTracks()[0]);
         }
       });
-    } catch (err) {
+    } catch (err: unknown) {
       console.error("Error restoring camera stream:", err);
     }
   };
@@ -476,7 +510,7 @@ const VideoCall = () => {
     if (!localStream) return;
     const recorder = new MediaRecorder(localStream);
     const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => chunks.push(e.data);
+    recorder.ondataavailable = (e: BlobEvent) => chunks.push(e.data);
     recorder.onstop = async () => {
       const blob = new Blob(chunks, { type: "video/webm" });
       const recordingsCollection = collection(db, "recordings");
@@ -488,6 +522,64 @@ const VideoCall = () => {
     };
     recorder.start();
     setTimeout(() => recorder.stop(), 30000);
+  };
+
+  const sendMessage = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!newMessage.trim()) return;
+
+    const message = {
+      id: crypto.randomUUID(),
+      text: newMessage,
+      senderId: clientId,
+      senderName: `User_${clientId.substring(0, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "text",
+    };
+
+    // Add message to local state
+    setMessages((prev) => [...prev, message]);
+
+    // Send message to all connected peers
+    Object.entries(dataChannels.current).forEach(([peerId, dataChannel]) => {
+      if (dataChannel.readyState === "open") {
+        try {
+          dataChannel.send(JSON.stringify(message));
+          console.log(`Sent message to ${peerId}:`, message.text);
+        } catch (err: unknown) {
+          console.error(`Error sending message to ${peerId}:`, err);
+        }
+      }
+    });
+
+    setNewMessage("");
+  };
+
+  const sendEmotion = (emotion: string) => {
+    setSelectedEmotion(emotion);
+    const message = {
+      id: crypto.randomUUID(),
+      text: emotion,
+      senderId: clientId,
+      senderName: `User_${clientId.substring(0, 8)}`,
+      timestamp: new Date().toISOString(),
+      type: "emotion",
+    };
+
+    // Add emotion to local state
+    setMessages((prev) => [...prev, message]);
+
+    // Send emotion to all connected peers
+    Object.entries(dataChannels.current).forEach(([peerId, dataChannel]) => {
+      if (dataChannel.readyState === "open") {
+        try {
+          dataChannel.send(JSON.stringify(message));
+          console.log(`Sent emotion to ${peerId}:`, emotion);
+        } catch (err: unknown) {
+          console.error(`Error sending emotion to ${peerId}:`, err);
+        }
+      }
+    });
   };
 
   const copyInviteLink = () => {
@@ -502,73 +594,204 @@ const VideoCall = () => {
     if (clientId && roomId) {
       try {
         await deleteDoc(doc(db, "rooms", roomId, "participants", clientId));
-      } catch (err) {
+      } catch (err: unknown) {
         console.error("Error leaving room:", err);
       }
     }
   };
 
+  const remoteStreamArray = Array.from(remoteStreams.entries());
+
   return (
-    <div className="min-h-screen bg-gray-100 flex flex-col items-center p-4">
-      <h1 className="text-3xl font-bold mb-4">MeetClone</h1>
-      <p className="mb-2">Room ID: {roomId}</p>
-      <button
-        className="bg-blue-500 text-white px-4 py-2 rounded mb-4 hover:bg-blue-600"
-        onClick={copyInviteLink}
-      >
-        Copy Invite Link
-      </button>
-      <div className="flex space-x-4 mb-4">
-        <button
-          className="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
-          onClick={startScreenShare}
-          disabled={isSharingScreen}
-        >
-          Share Screen
-        </button>
-        <button
-          className="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600"
-          onClick={stopScreenShare}
-          disabled={!isSharingScreen}
-        >
-          Stop Sharing
-        </button>
-        <button
-          className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600"
-          onClick={startRecording}
-        >
-          Record
-        </button>
-        <button
-          className="bg-gray-500 text-white px-4 py-2 rounded hover:bg-gray-600"
-          onClick={leaveRoom}
-        >
-          Leave Room
-        </button>
+    <div className="min-h-screen bg-gray-900 flex">
+      {/* Emotions Panel */}
+      <div className="w-24 bg-gray-800 text-white flex flex-col border-r border-gray-700">
+        <div className="p-4 border-b border-gray-700">
+          <h2 className="text-lg font-semibold">Emotions</h2>
+        </div>
+        <div className="flex-1 p-2 flex flex-col space-y-2 overflow-y-auto">
+          {emotions.map((emotion) => (
+            <button
+              key={emotion}
+              onClick={() => sendEmotion(emotion)}
+              className={`p-2 rounded-lg text-sm font-medium transition-colors ${
+                selectedEmotion === emotion
+                  ? "bg-blue-600 text-white"
+                  : "bg-gray-700 text-white hover:bg-gray-600"
+              }`}
+            >
+              {emotion}
+            </button>
+          ))}
+        </div>
       </div>
-      <div className="grid grid-cols-2 gap-4 max-w-4xl">
-        {localStream && (
-          <div className="relative">
-            <VideoPlayer stream={localStream} muted={true} />
-            <p className="absolute bottom-2 left-2 text-white bg-black bg-opacity-50 px-2 py-1 rounded">
-              You
-            </p>
+
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col">
+        {/* Header */}
+        <div className="bg-gray-800 text-white p-4 flex flex-col items-center">
+          <h1 className="text-2xl font-bold mb-2">MeetClone</h1>
+          <p className="text-sm text-gray-300 mb-3">Room ID: {roomId}</p>
+          <button
+            className="bg-blue-600 text-white px-4 py-2 rounded mb-3 hover:bg-blue-700 transition-colors"
+            onClick={copyInviteLink}
+          >
+            Copy Invite Link
+          </button>
+          <div className="flex space-x-2">
+            <button
+              className="bg-blue-600 text-white px-3 py-1 rounded text-sm hover:bg-blue-700 transition-colors"
+              onClick={startScreenShare}
+              disabled={isSharingScreen}
+            >
+              Share Screen
+            </button>
+            <button
+              className="bg-red-600 text-white px-3 py-1 rounded text-sm hover:bg-red-700 transition-colors"
+              onClick={stopScreenShare}
+              disabled={!isSharingScreen}
+            >
+              Stop Sharing
+            </button>
+            <button
+              className="bg-green-600 text-white px-3 py-1 rounded text-sm hover:bg-green-700 transition-colors"
+              onClick={startRecording}
+            >
+              Record
+            </button>
+            <button
+              className="bg-gray-600 text-white px-3 py-1 rounded text-sm hover:bg-gray-700 transition-colors"
+              onClick={leaveRoom}
+            >
+              Leave Room
+            </button>
           </div>
-        )}
-        {Array.from(remoteStreams.entries()).map(([peerId, stream]) => (
-          <div key={peerId} className="relative">
-            <VideoPlayer stream={stream} muted={false} />
-            <p className="absolute bottom-2 left-2 text-white bg-black bg-opacity-50 px-2 py-1 rounded">
-              Participant ({peerId.substring(0, 8)})
-            </p>
+        </div>
+
+        {/* Video Container */}
+        <div className="flex-1 relative bg-gray-900">
+          {remoteStreamArray.length > 0 ? (
+            <>
+              <div className="w-full h-full p-4">
+                <div
+                  className={`w-full h-full gap-4 ${
+                    remoteStreamArray.length === 1
+                      ? "flex items-center justify-center"
+                      : remoteStreamArray.length === 2
+                      ? "grid grid-cols-2"
+                      : remoteStreamArray.length === 3
+                      ? "grid grid-cols-3"
+                      : remoteStreamArray.length === 4
+                      ? "grid grid-cols-2 grid-rows-2"
+                      : remoteStreamArray.length <= 6
+                      ? "grid grid-cols-3 grid-rows-2"
+                      : remoteStreamArray.length <= 9
+                      ? "grid grid-cols-3 grid-rows-3"
+                      : "grid grid-cols-4 grid-rows-3"
+                  }`}
+                >
+                  {remoteStreamArray.map(([peerId, stream]) => (
+                    <div
+                      key={peerId}
+                      className="relative bg-gray-800 rounded-lg overflow-hidden shadow-lg border border-gray-600 min-h-0"
+                    >
+                      <VideoPlayer stream={stream} muted={false} />
+                      <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 text-white px-2 py-1 rounded text-xs">
+                        Participant ({peerId.substring(0, 8)})
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {localStream && (
+                <div
+                  className="absolute bottom-6 right-6 w-48 h-32 bg-gray-800 rounded-lg overflow-hidden shadow-lg border-2 border-blue-500"
+                  style={{ zIndex: 10 }}
+                >
+                  <VideoPlayer stream={localStream} muted={true} />
+                  <div className="absolute bottom-1 left-1 bg-black bg-opacity-70 text-white px-2 py-1 rounded text-xs">
+                    You {isSharingScreen ? "(Sharing)" : ""}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="flex items-center justify-center h-full">
+              <div className="text-center text-gray-400">
+                <div className="text-6xl mb-4">👥</div>
+                <p className="text-xl">Waiting for participants to join...</p>
+                <p className="text-sm mt-2">Share the invite link to get started</p>
+                {localStream && (
+                  <div className="mt-8 w-96 h-64 mx-auto bg-gray-800 rounded-lg overflow-hidden shadow-lg border-2 border-blue-500 relative">
+                    <VideoPlayer stream={localStream} muted={true} />
+                    <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 text-white px-2 py-1 rounded text-xs">
+                      You {isSharingScreen ? "(Sharing)" : ""}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Status Bar */}
+        <div className="bg-gray-800 text-gray-300 p-2 text-xs">
+          <div className="flex justify-center space-x-4">
+            <span>Local: {localStream ? "Connected" : "Not connected"}</span>
+            <span>Remote Streams: {remoteStreams.size}</span>
+            <span>Connections: {Object.keys(peerConnections.current).length}</span>
+            <span>Participants: {participants.size}</span>
           </div>
-        ))}
+        </div>
       </div>
-      <div className="mt-4 text-sm text-gray-600">
-        <p>Local Stream: {localStream ? "Connected" : "Not connected"}</p>
-        <p>Remote Streams: {remoteStreams.size}</p>
-        <p>Peer Connections: {Object.keys(peerConnections.current).length}</p>
-        <p>Participants: {participants.size}</p>
+
+      {/* Chat Panel */}
+      <div className="w-80 bg-gray-800 text-white flex flex-col border-l border-gray-700">
+        <div className="p-4 border-b border-gray-700">
+          <h2 className="text-lg font-semibold">Chat</h2>
+        </div>
+        <div className="flex-1 p-4 overflow-y-auto">
+          {messages.map((message) => (
+            <div
+              key={message.id}
+              className={`mb-3 ${message.senderId === clientId ? "text-right" : "text-left"}`}
+            >
+              <p className="text-xs text-gray-400">
+                {message.senderName} • {new Date(message.timestamp).toLocaleTimeString()}
+              </p>
+              <div
+                className={`inline-block p-2 rounded-lg ${
+                  message.type === "emotion"
+                    ? "bg-purple-600 text-white font-semibold"
+                    : message.senderId === clientId
+                    ? "bg-blue-600 text-white"
+                    : "bg-gray-700 text-white"
+                }`}
+              >
+                {message.type === "emotion" ? `Feeling: ${message.text}` : message.text}
+              </div>
+            </div>
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
+        <div className="p-4 border-t border-gray-700">
+          <form onSubmit={sendMessage} className="flex space-x-2">
+            <input
+              type="text"
+              value={newMessage}
+              onChange={(e) => setNewMessage(e.target.value)}
+              onKeyPress={(e) => e.key === "Enter" && sendMessage(e as any)}
+              placeholder="Type a message..."
+              className="flex-1 bg-gray-700 text-white px-3 py-2 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <button
+              type="submit"
+              className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 transition-colors"
+            >
+              Send
+            </button>
+          </form>
+        </div>
       </div>
     </div>
   );
