@@ -71,6 +71,16 @@ const VideoCall: React.FC = () => {
 
   const emotions = ["Sad", "Happy", "Anxious", "Angry", "Fear", "Disgust"];
 
+  const styleMap: Record<string, { bg: string; border: string; text: string }> = {
+  Sad: { bg: "bg-blue-300", border: "border-blue-500", text: "text-blue-900" },
+  Happy: { bg: "bg-yellow-300", border: "border-yellow-500", text: "text-yellow-900" },
+  Anxious: { bg: "bg-purple-300", border: "border-purple-500", text: "text-purple-900" },
+  Angry: { bg: "bg-red-400", border: "border-red-600", text: "text-red-900" },
+  Fear: { bg: "bg-gray-400", border: "border-gray-600", text: "text-gray-900" },
+  Disgust: { bg: "bg-green-300", border: "border-green-500", text: "text-green-900" },
+};
+
+
   useEffect(() => {
     console.log("Initialized with clientId:", clientId);
   }, [clientId]);
@@ -506,23 +516,7 @@ const VideoCall: React.FC = () => {
     }
   };
 
-  const startRecording = async () => {
-    if (!localStream) return;
-    const recorder = new MediaRecorder(localStream);
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = (e: BlobEvent) => chunks.push(e.data);
-    recorder.onstop = async () => {
-      const blob = new Blob(chunks, { type: "video/webm" });
-      const recordingsCollection = collection(db, "recordings");
-      await addDoc(recordingsCollection, {
-        roomId,
-        timestamp: new Date().toISOString(),
-        url: "placeholder_url",
-      });
-    };
-    recorder.start();
-    setTimeout(() => recorder.stop(), 30000);
-  };
+  
 
   const sendMessage = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -604,27 +598,38 @@ const VideoCall: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-gray-900 flex">
-      {/* Emotions Panel */}
-      <div className="w-24 bg-gray-800 text-white flex flex-col border-r border-gray-700">
-        <div className="p-4 border-b border-gray-700">
-          <h2 className="text-lg font-semibold">Emotions</h2>
-        </div>
-        <div className="flex-1 p-2 flex flex-col space-y-2 overflow-y-auto">
-          {emotions.map((emotion) => (
-            <button
-              key={emotion}
-              onClick={() => sendEmotion(emotion)}
-              className={`p-2 rounded-lg text-sm font-medium transition-colors ${
-                selectedEmotion === emotion
-                  ? "bg-blue-600 text-white"
-                  : "bg-gray-700 text-white hover:bg-gray-600"
-              }`}
-            >
-              {emotion}
-            </button>
-          ))}
-        </div>
-      </div>
+
+      
+{/* Emotions Panel */}
+<div className="w-24 bg-gray-800 text-white flex flex-col border-r border-gray-700">
+  <div className="p-4 border-b border-gray-700">
+    <h2 className="text-lg font-semibold">Emotions</h2>
+  </div>
+  <div className="flex-1 p-2 flex flex-col space-y-2 overflow-y-auto">
+    {emotions.map((emotion) => {
+      const styles = styleMap[emotion];
+      const isSelected = selectedEmotion === emotion;
+
+      return (
+        <button
+          key={emotion}
+          onClick={() => sendEmotion(emotion)}
+          className={`px-3 py-2 rounded-full text-sm font-bold transition-transform transform hover:scale-105 border-4 shadow-md
+            ${
+              isSelected
+                ? `${styles.bg} ${styles.border} ${styles.text}`
+                : `${styles.bg} ${styles.border} ${styles.text} opacity-80 hover:opacity-100`
+            }`}
+        >
+          {emotion}
+        </button>
+      );
+    })}
+  </div>
+</div>
+
+
+
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col">
@@ -653,12 +658,7 @@ const VideoCall: React.FC = () => {
             >
               Stop Sharing
             </button>
-            <button
-              className="bg-green-600 text-white px-3 py-1 rounded text-sm hover:bg-green-700 transition-colors"
-              onClick={startRecording}
-            >
-              Record
-            </button>
+           
             <button
               className="bg-gray-600 text-white px-3 py-1 rounded text-sm hover:bg-gray-700 transition-colors"
               onClick={leaveRoom}
@@ -750,7 +750,7 @@ const VideoCall: React.FC = () => {
         <div className="p-4 border-b border-gray-700">
           <h2 className="text-lg font-semibold">Chat</h2>
         </div>
-        <div className="flex-1 p-4 overflow-y-auto">
+        <div className="flex-1 p-4 overflow-y-auto max-h-[calc(100vh-180px)]">
           {messages.map((message) => (
             <div
               key={message.id}
